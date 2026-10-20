@@ -9,6 +9,7 @@ from typing import Any, NamedTuple
 from sqlalchemy import func, select
 
 from repowise.core.analysis.risk_semantics import file_risk_scales
+from repowise.core.analysis.test_reachability import direct_importers
 from repowise.core.ingestion.models import FILE_DEPENDENCY_EDGE_TYPES
 from repowise.core.persistence.batches import chunked
 from repowise.core.persistence.crud import get_graph_nodes_by_ids, get_test_file_paths
@@ -22,6 +23,7 @@ from repowise.core.registry import ToolRecipe
 from repowise.core.registry import mcp_tool_registry as mcp
 from repowise.core.support_paths import is_doc_or_config_path
 from repowise.server.mcp_server._budget import OmissionCollector, cap_collection
+from repowise.server.mcp_server._changes import file_changes
 from repowise.server.mcp_server._episodes import enrich_episode_counts as _enrich_episodes
 from repowise.server.mcp_server._helpers import (
     _get_exclude_spec,
@@ -35,6 +37,21 @@ from repowise.server.mcp_server._helpers import (
     resolve_enum_argument,
 )
 from repowise.server.mcp_server._meta import build_meta as _build_meta
+from repowise.server.mcp_server._meta import served_root
+from repowise.server.mcp_server._test_selection import (
+    SelectionUnavailableError,
+    files_change,
+    select_change_tests,
+)
+from repowise.server.mcp_server._workspace_routing import (
+    hint_misses,
+    needs_routing,
+    one_repo_refusal,
+    rekey_targets,
+    route_targets,
+    settle_missing,
+    single_repo,
+)
 
 from .assessment import (
     _assess_one_target,
@@ -42,7 +59,7 @@ from .assessment import (
     fix_annotation,
     normalize_target_path,
 )
-from .directives import _build_pr_directive, _governance_directive
+from .directives import ChangeTests, _build_pr_directive, _governance_directive
 from .enrichment import _enrich_cross_repo, _enrich_health
 
 #: Fields an agent cannot rank or act on: uncalibrated pagerank floats, and
@@ -79,12 +96,21 @@ _TARGET_CARD_INCLUDES: dict[str, tuple[str, ...]] = {
         "relationship_analysis",
     ),
     "churn": ("change_magnitude", "risk_type", "change_pattern"),
+    "owners": (
+        "owner_pct",
+        "owner_line_pct",
+        "recent_owner",
+        "recent_owner_pct",
+        "bus_factor",
+        "contributor_count",
+    ),
 }
 _BLAST_INCLUDES: dict[str, tuple[str, ...]] = {"graph": ("direct_risks",)}
 #: Per-field units and calibration. Identical on every call, so it is opt-in.
 #: ``tests`` adds the PR directive's typed ``test_recommendations`` rows and
-#: ``blast`` the ``pr_blast_radius`` dossier.
-_INCLUDE_BLOCKS = frozenset(_TARGET_CARD_INCLUDES) | {"blast", "scales", "tests"}
+#: ``blast`` the ``pr_blast_radius`` dossier, ``changes`` each file's recent
+#: Change Records.
+_INCLUDE_BLOCKS = frozenset(_TARGET_CARD_INCLUDES) | {"blast", "scales", "tests", "changes"}
 
 
 def _drop_opt_in_blocks(response: dict, include: set[str]) -> None:
@@ -257,7 +283,8 @@ async def _gather_evidence(
         repo_id = repository.id
         # A card walks from the target as given and reads links under its
         # normalized path, so both spellings are roots.
-        roots = {*targets, *(normalize_target_path(t, repository.local_path) for t in targets)}
+        repo_root = served_root(repository, ctx.path)
+        roots = {*targets, *(normalize_target_path(t, repo_root) for t in targets)}
         graph = await _load_dependency_graph(session, repo_id, roots)
 
         # Repo-wide, so computed once for every target's bus-factor calibration.
@@ -285,6 +312,7 @@ async def _gather_evidence(
                     collector,
                     include_graph,
                     as_of_ts=as_of_ts,
+                    repo_root=repo_root,
                 )
                 for t in targets
             ]
@@ -321,6 +349,45 @@ async def _enrich_cards(
     await asyncio.to_thread(_enrich_episodes, scored, ctx.path)
 
 
+async def _attach_changes(results: list[dict], ctx: Any) -> None:
+    """Each resolved card's recent Change Records (``include=["changes"]``)."""
+    from repowise.core.attribution import attribution_enabled
+
+    async with get_session(ctx.session_factory) as session:
+        repository = await _get_repo(session)
+        attribution = attribution_enabled(repository.local_path)
+        root = served_root(repository, ctx.path)
+        cards = {
+            normalize_target_path(card["target"], repo_root=root): card
+            for card in results
+            if card.get("resolved") is not False
+        }
+        found = await file_changes(session, repository, list(cards), attribution=attribution)
+        for path, card in cards.items():
+            card.update(found[path])
+
+
+async def _change_tests(ctx: Any, paths: list[str]) -> ChangeTests:
+    """The selection for a change known by its paths, and the tests importing them.
+
+    Every path counts, excluded or not: a test can break on any of them.
+    """
+    try:
+        change = await asyncio.to_thread(files_change, ctx.path, paths)
+        result, selection, checkout = await select_change_tests(
+            ctx.path, ctx.session_factory, change
+        )
+        async with get_session(ctx.session_factory) as session:
+            importers = await direct_importers(session, (await _get_repo(session)).id, paths)
+    except SelectionUnavailableError as exc:
+        return ChangeTests(status=exc.status, message=str(exc))
+    except Exception as exc:  # the rest of the directive stands without its tests
+        return ChangeTests(status="unknown", message=f"Could not select tests: {exc}")
+    return ChangeTests(
+        result=result, selection=selection, importers=importers, roots=checkout.roots
+    )
+
+
 async def _lead_with_pr_directive(
     response: dict,
     evidence: _RiskEvidence,
@@ -331,6 +398,7 @@ async def _lead_with_pr_directive(
     full_scale: bool,
     include_tests: bool,
     include_blast: bool,
+    touched: list[str] | None = None,
 ) -> dict:
     governance_risk = await _governance_directive(ctx, changed_files)
     _build_pr_directive(
@@ -342,6 +410,7 @@ async def _lead_with_pr_directive(
         governance_risk,
         evidence.test_paths,
         ctx.alias,
+        tests=await _change_tests(ctx, touched or changed_files),
         full_scale=full_scale,
         include_tests=include_tests,
         include_blast=include_blast,
@@ -381,9 +450,8 @@ async def get_risk(
     reach (source depends on target), ``consumers`` require typed contract links,
     and ``co_change_partners`` are historical correlation only. Those counts
     are a floor over the indexed graph. Structural reach is not proof of
-    runtime breakage. The response also includes security
-    findings. Pass changed_files for PR mode: the response leads with a
-    directive block (may_break, missing_cochanges, missing_tests,
+    runtime breakage. Security findings are included. Pass changed_files for PR mode: the response leads with
+    ``directive`` (may_break, missing_cochanges, missing_tests,
     tests_to_run, tests_to_update) — read it first. ``tests_to_run_basis`` says
     measured or inferred. To score a commit or ``base..head`` range instead,
     use ``get_change_risk``.
@@ -402,13 +470,36 @@ async def get_risk(
         targets: file paths to assess; defaults to changed_files.
         repo: usually omitted.
         changed_files: PR-changed files for blast-radius mode.
-        include: opt-in blocks - "graph", "churn", "tests" (typed test
-            rows), "blast", "scales" (units and calibration).
+        include: opt-in blocks - "graph", "churn", "owners", "tests" (typed test
+            rows), "blast", "scales" (units, calibration), "changes".
     """
     if repo == "all":
         return _unsupported_repo_all("get_risk")
     if not targets and not changed_files:
         return {"error": "targets or changed_files is required", "_meta": _build_meta()}
+    routes = (
+        await route_targets([*(targets or []), *(changed_files or [])], paths_only=True)
+        if repo is None
+        else None
+    )
+    if routes is not None and changed_files:
+        routes = settle_missing(routes, set(changed_files))
+    if needs_routing(routes):
+        alias = single_repo(routes)
+        if alias is None:
+            return {**one_repo_refusal("get_risk", routes), "_meta": _build_meta()}
+        local = {r.target: r.local for r in routes}
+        routed = await get_risk(
+            [local[t] for t in targets] if targets else None,
+            repo=alias,
+            changed_files=[local[t] for t in changed_files] if changed_files else None,
+            include=include,
+        )
+        rekey_targets(routed, routes)
+        if any(r.routed for r in routes):
+            routed["repo"] = alias
+        hint_misses(routed, routes)
+        return routed
     ignored: list[dict] = []
     include_set = {
         block
@@ -418,6 +509,7 @@ async def get_risk(
     ctx = await _resolve_repo_context(repo)
     collector = OmissionCollector("get_risk", repo_root=ctx.path)
     exclude_spec = _get_exclude_spec(ctx.path)
+    touched = list(dict.fromkeys(changed_files or ()))
     targets = filter_path_list(targets or changed_files, exclude_spec)
     changed_files = filter_path_list(changed_files, exclude_spec)
     include_graph = "graph" in include_set
@@ -425,6 +517,8 @@ async def get_risk(
         ctx, targets, changed_files, exclude_spec, collector, include_graph
     )
     await _enrich_cards(evidence.results, ctx, evidence.repository.id, collector, include_graph)
+    if "changes" in include_set:
+        await _attach_changes(evidence.results, ctx)
 
     # The budget sheds cards from the tail, so docs and config cards go last.
     cards = evidence.results
@@ -445,6 +539,7 @@ async def get_risk(
             full_scale="scales" in include_set,
             include_tests="tests" in include_set,
             include_blast="blast" in include_set,
+            touched=touched,
         )
     elif len(targets) > 1:
         # Ambient hotspots orient a multi-file request; beside one named file they are noise.

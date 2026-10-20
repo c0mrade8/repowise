@@ -5,8 +5,9 @@ sets (definition, imports, calls, references) from :mod:`_edit_sites`. A
 single-token query naming no indexed symbol (a number, a quoted string, an
 unindexed name) is scanned for in every file git lists (tracked and
 untracked, ignore rules applied), so config and docs the indexer never parsed
-are read too. ``complete`` is true only when nothing was skipped or capped,
-so the lines are every match.
+are read too. git grep narrows that list to the files holding the token;
+without it the scan reads source files first. ``complete`` is true only when
+nothing was skipped or capped, so the lines are every match.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ import os
 import re
 import subprocess
 import time
+from collections import Counter
 from collections.abc import Container
 from pathlib import Path
 from typing import Any
@@ -28,10 +30,14 @@ from repowise.core.fs_walk import PRUNED_DIRS, walk_repo
 from repowise.core.persistence.database import get_session
 from repowise.core.persistence.models import GraphNode
 from repowise.core.repo_config import load_repo_config
-from repowise.server.mcp_server._budget import register_post_enforce
+from repowise.core.support_paths import file_population
+from repowise.core.test_paths import is_test_related_path
+from repowise.server.mcp_server._budget import OmissionCollector, register_post_enforce
 from repowise.server.mcp_server._edit_sites import (
     _MAX_FILE_BYTES,
+    MAX_REFERENCES_PER_FILE,
     MAX_TEXT_CHARS,
+    _cap_references_per_file,
     reference_edit_set,
 )
 from repowise.server.mcp_server._helpers import (
@@ -41,7 +47,9 @@ from repowise.server.mcp_server._helpers import (
     is_excluded,
     read_repo_file_text,
 )
+from repowise.server.mcp_server._meta import served_root
 from repowise.server.mcp_server._query_shape import (
+    _NL_QUESTION_TOKENS,
     _canonical_symbol_query,
     _identifier_candidates,
     _qual_norm,
@@ -51,30 +59,55 @@ from repowise.server.mcp_server._symbol_lookup import symbol_id_variants
 _log = logging.getLogger("repowise.mcp.search")
 
 MAX_LINES = 50
+# A multi-word query's page rows already rank files, so its lines are a short
+# lead-in (production first) and lines_omitted_by_file names the top files only.
+MAX_LINES_MIXED = 15
+MAX_OMITTED_FILES = 5
+OVER_LINES_MIXED = f"over {MAX_LINES_MIXED} lines for a multi-word query; search one name for more"
 MAX_LINES_PER_FILE = 5
 MAX_SYMBOLS = 3
 MAX_SCAN_FILES = 20_000
 MAX_SCAN_BYTES = 32_000_000
 # Wall-clock ceiling on the literal scan; past it the lines are marked incomplete.
 MAX_SCAN_SECONDS = 0.5
+# Past this git grep is abandoned for the Python scan.
+_GIT_GREP_SECONDS = 5.0
 _SNIFF_BYTES = 8192
 # A binary past this is not streamed for the token; it is reported as skipped.
 _MAX_STREAM_BYTES = 64_000_000
 OVER_LINES = f"over {MAX_LINES} lines"
 _KIND_ORDER = {"definition": 0, "import": 1, "call": 2, "reference": 3, "match": 4}
+# Under the short mixed-query cap, call sites say more than imports.
+_MIXED_KIND_ORDER = {"definition": 0, "call": 1, "import": 2, "reference": 3, "match": 3}
 _QUOTED = re.compile(r"""^(["'`])(.+)\1$""")
 _TOKEN = re.compile(r"^[A-Za-z0-9_$][\w$.]*$")
+# Code punctuation: a leading decorator ``@``, an identifier glued to an opening
+# ``(`` or ``{`` (``send(``), or a glued ``=`` (``path="/x"``). Prose such as
+# ``Add (optional) support`` has a space before its parenthesis and matches none.
+_CODE_PUNCT = re.compile(r"^@\w|[\w)\]][({]|\S=\S")
 _DECL_WORDS = r"def|class|function|const|let|var|fn|func|type|interface|struct|enum"
 
 
 def _literal(query: str) -> tuple[str, bool] | None:
-    """``(needle, word_bounded)`` for a single-token query, else ``None``."""
+    """``(needle, word_bounded)`` for a single-token or code-shaped query, else ``None``."""
     q = query.strip()
     if m := _QUOTED.match(q):
         return m.group(2), False
     if len(q) >= 2 and _TOKEN.match(q) and not q.endswith("."):
         return q, True
+    if _is_code_shaped(q):
+        return q, False
     return None
+
+
+def _is_code_shaped(q: str) -> bool:
+    """A one-line, non-question query carrying code punctuation, scanned as-is."""
+    if len(q) < 3 or "\n" in q or q.endswith("?"):
+        return False
+    words = q.split()
+    if words[0].lower().rstrip(",.;:") in _NL_QUESTION_TOKENS:
+        return False
+    return _CODE_PUNCT.search(q) is not None
 
 
 def _definition_re(needle: str, word: bool) -> re.Pattern[str]:
@@ -148,27 +181,65 @@ def _is_utf8(data: bytes) -> bool:
     return True
 
 
-def _listed_files(root: Path) -> list[str]:
-    """Tracked and untracked files minus ignored ones, or a pruned walk without git."""
-    cmd = ["git", "-C", str(root), "ls-files", "-z", "--cached", "--others", "--exclude-standard"]
+def _git_paths(
+    root: Path, args: list[str], timeout: float, ok: tuple[int, ...]
+) -> list[str] | None:
+    """The NUL-separated paths a git command prints outside pruned dirs, or ``None`` on failure."""
     try:
         proc = subprocess.run(
-            cmd, capture_output=True, stdin=subprocess.DEVNULL, timeout=10, check=False
+            ["git", "-C", str(root), *args],
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            timeout=timeout,
+            check=False,
         )
-    except (OSError, subprocess.SubprocessError):
-        proc = None
-    if proc is not None and proc.returncode == 0:
-        listed = proc.stdout.decode("utf-8", errors="replace").split("\0")
-        return sorted(
-            {p for p in listed if p and not PRUNED_DIRS.intersection(p.split("/")[:-1])}
-        )
-    return sorted(
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if proc.returncode not in ok:
+        return None
+    listed = proc.stdout.decode("utf-8", errors="replace").split("\0")
+    return [
+        p for p in dict.fromkeys(listed) if p and not PRUNED_DIRS.intersection(p.split("/")[:-1])
+    ]
+
+
+def _listed_files(root: Path) -> list[str]:
+    """Tracked and untracked files minus ignored ones, or a pruned walk without git."""
+    args = ["ls-files", "-z", "--cached", "--others", "--exclude-standard"]
+    listed = _git_paths(root, args, 10, (0,))
+    if listed is not None:
+        return listed
+    return [
         (Path(d) / f).relative_to(root).as_posix() for d, _, names in walk_repo(root) for f in names
-    )
+    ]
+
+
+def _files_holding(root: Path, needle: str) -> list[str] | None:
+    """The files :func:`_listed_files` would list whose bytes hold *needle*, via git grep.
+
+    ``None`` when git cannot answer in time, for a needle that is not one plain
+    argument, or for a non-ASCII one, whose misses in non-UTF-8 files only the
+    Python scan can report.
+    """
+    if not needle.isascii() or "\n" in needle or "\0" in needle or needle.startswith("-"):
+        return None
+    args = ["-c", "grep.fullName=false", "grep", "-l", "-z", "--untracked", "--no-color", "-F"]
+    args += ["-e", needle]
+    # Exit 1 is "no file matched".
+    return _git_paths(root, args, _GIT_GREP_SECONDS, (0, 1))
+
+
+def _scan_rank(rel: str) -> int:
+    """Production code first, then tests, examples, and docs or config."""
+    population = file_population(rel, is_test=is_test_related_path(rel))
+    return ("production", "test", "example", "doc").index(population)
 
 
 def _scan_listed(root: Path, needle: str, word: bool) -> tuple[list[dict[str, Any]], list[str]]:
-    files = _listed_files(root)
+    held = _files_holding(root, needle)
+    files = _listed_files(root) if held is None else held
+    # Ordered so a scan that stops on a budget has read source before docs.
+    files = sorted(files, key=lambda f: (_scan_rank(f), f))
     patterns = load_repo_config(root).get("exclude_patterns") or []
     reasons: list[str] = []
     if patterns:
@@ -182,6 +253,14 @@ def _scan_listed(root: Path, needle: str, word: bool) -> tuple[list[dict[str, An
         files = kept
     rows, scan_reasons = scan_literal(root, files, needle, word)
     return rows, reasons + scan_reasons
+
+
+def production_lines(root: Path, token: str) -> list[dict[str, Any]]:
+    """The word-bounded lines holding *token* in production files, from the
+    same scan a literal search runs. For get_answer, which reads live lines
+    the wiki never rendered (function bodies, string literals)."""
+    rows, _reasons = _scan_listed(root, token, True)
+    return [r for r in rows if _scan_rank(r["path"]) == 0]
 
 
 def scan_literal(
@@ -220,7 +299,8 @@ def scan_literal(
                     continue
                 if scanned + size > MAX_SCAN_BYTES:
                     reasons.append(
-                        f"over {MAX_SCAN_BYTES // 1_000_000} MB: scanned {i} of {len(files)} files"
+                        f"over {MAX_SCAN_BYTES // 1_000_000} MB: scanned {i} of {len(files)}"
+                        " files, source first"
                     )
                     break
                 scanned += size
@@ -343,6 +423,10 @@ async def _attach(
         return
     literal = _literal(query)
     candidates = _identifier_candidates(query, mode, names)
+    if literal and not literal[1] and not _QUOTED.match(query.strip()):
+        # Code punctuation names the text itself: an identifier inside it
+        # (``copy_with`` in ``copy_with(path="/x")``) is not the question.
+        candidates = []
     if not candidates and literal and literal[1]:
         candidates = [literal[0]]
     if not candidates and not literal:
@@ -351,7 +435,7 @@ async def _attach(
     spec = _get_exclude_spec(ctx.path)
     async with get_session(ctx.session_factory) as session:
         repository = await _get_repo(session)
-        root = Path(repository.local_path or ctx.path)
+        root = Path(served_root(repository, ctx.path))
         nodes = []
         if candidates:
             found = await _exact_symbols(session, repository.id, query, candidates)
@@ -368,13 +452,66 @@ async def _attach(
         rows, reasons = await asyncio.to_thread(_scan_listed, root, *literal)
     else:
         return
-    rows.sort(key=lambda r: (_KIND_ORDER[r["kind"]], r["path"], r["line"]))
-    if len(rows) > MAX_LINES and OVER_LINES not in reasons:
-        reasons.append(OVER_LINES)
-    response["lines"] = rows[:MAX_LINES]
+    mixed = not literal and len(query.split()) > 1
+    order = _MIXED_KIND_ORDER if mixed else _KIND_ORDER
+    # Production before test within each kind group: every kind for a mixed
+    # query, definitions against the rest otherwise.
+    rows.sort(
+        key=lambda r: (
+            order[r["kind"]] if mixed else r["kind"] != "definition",
+            is_test_related_path(r["path"]),
+            order[r["kind"]],
+            r["path"],
+            r["line"],
+        )
+    )
+    kept = _cap_references_per_file(rows)
+    if len(kept) < len(rows):
+        reasons.append(
+            f"{len(rows) - len(kept)} references past {MAX_REFERENCES_PER_FILE} per file"
+            " not shown: lines_omitted_by_file; the full list is under _meta.omitted"
+        )
+    cap, over = (MAX_LINES_MIXED, OVER_LINES_MIXED) if mixed else (MAX_LINES, OVER_LINES)
+    if len(kept) > cap and over not in reasons:
+        reasons.append(over)
+    response["lines"] = kept[:cap]
+    if len(response["lines"]) < len(rows):
+        shown = {id(r) for r in response["lines"]}
+        hidden = [r for r in rows if id(r) not in shown]
+        collector = OmissionCollector("search_codebase", repo_root=ctx.path)
+        collector.add(f"{query} :: lines not shown", hidden)
+        collector.attach(response)
+        by_file = Counter(r["path"] for r in hidden)
+        if mixed and len(by_file) > MAX_OMITTED_FILES:
+            response["lines_omitted_by_file"] = dict(by_file.most_common(MAX_OMITTED_FILES))
+            response["lines_omitted_by_file_total"] = len(by_file)
+        else:
+            response["lines_omitted_by_file"] = dict(by_file)
     response["complete"] = not reasons
     if reasons:
         response["reasons"] = reasons
+    if response["lines"]:
+        _reconcile_symbol_miss(response, literal_scan=not sets)
+
+
+def _reconcile_symbol_miss(response: dict, *, literal_scan: bool) -> None:
+    """Keep the symbol stage's miss advice from contradicting the lines found.
+
+    ``grep_hint`` and the no-exact-symbol ``note`` were written before any
+    line was read, and tell the reader to recheck spelling or grep. With
+    lines in hand both are wrong; ``exact_match: false`` still says no symbol
+    has the name, so the note stays only to label fuzzy results.
+    """
+    response.pop("grep_hint", None)
+    if not literal_scan or response.get("exact_match") is not False:
+        return
+    if response.get("results"):
+        response["note"] = (
+            "No indexed symbol has this exact name: the results are other "
+            "symbols, and `lines` are where the text occurs."
+        )
+    else:
+        response.pop("note", None)
 
 
 def _lines_after_budget(result: dict[str, Any]) -> None:

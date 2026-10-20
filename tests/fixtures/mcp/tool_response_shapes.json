@@ -46,8 +46,7 @@
     ],
     "quotes_emitted": null,
     "quotes_reduced_reason": null,
-    "quotes_total": null,
-    "retrieval_quality": null
+    "quotes_total": null
   },
   "get_architecture": {
     "_meta": {
@@ -174,10 +173,8 @@
       "reasons": [],
       "status": null
     },
-    "exclude_patterns": [],
     "fix_history": {
       "available": null,
-      "density": null,
       "files": [
         {
           "churn": null,
@@ -210,6 +207,18 @@
       "by_dimension": {},
       "by_severity": {},
       "explanation": null,
+      "files": [
+        {
+          "base_score": null,
+          "base_structure": null,
+          "head_score": null,
+          "head_structure": null,
+          "nloc_base": null,
+          "nloc_head": null,
+          "path": null
+        }
+      ],
+      "files_total": null,
       "findings_emitted": null,
       "findings_total": null,
       "introduced": null,
@@ -220,6 +229,15 @@
         "eligible": null,
         "failed": null,
         "skipped": null
+      },
+      "score_basis": null,
+      "score_change": {
+        "base": null,
+        "delta": null,
+        "files_compared": null,
+        "head": null,
+        "structure_delta": null,
+        "weighting": null
       },
       "skipped": {
         "by_reason": {
@@ -233,13 +251,6 @@
     },
     "impacted_tests": {
       "basis": null,
-      "line_coverage": {
-        "covered": [],
-        "no_coverage_data": [],
-        "stale_test_candidates": [],
-        "untested_changes": []
-      },
-      "map_present": null,
       "status": null,
       "summary": null,
       "tests_to_run": [
@@ -248,11 +259,9 @@
       "total": null,
       "truncated": null
     },
-    "is_fix": null,
     "ref": null,
     "review_priority": null,
-    "risk_percentile": null,
-    "working_tree": null
+    "risk_percentile": null
   },
   "get_conformance": {
     "_meta": {
@@ -758,8 +767,12 @@
       "performance_average": null,
       "performance_coverage_pct": null,
       "performance_covered_files": null,
-      "performance_findings": null,
-      "performance_findings_density_per_10k_loc": null,
+      "performance_causes": {
+        "all": null,
+        "now": null,
+        "per_10k_loc": null,
+        "production": null
+      },
       "performance_skipped_files": null,
       "performance_unsupported_languages": [
         null
@@ -1235,40 +1248,18 @@
     "code_health": {
       "average_health": null,
       "band": null,
-      "distribution": {
-        "bands": {
-          "at_risk": {
-            "files": null,
-            "nloc": null,
-            "pct": null
-          },
-          "excellent": {
-            "files": null,
-            "nloc": null,
-            "pct": null
-          },
-          "fair": {
-            "files": null,
-            "nloc": null,
-            "pct": null
-          },
-          "good": {
-            "files": null,
-            "nloc": null,
-            "pct": null
-          },
-          "needs_work": {
-            "files": null,
-            "nloc": null,
-            "pct": null
-          }
-        },
-        "total_files": null,
-        "total_nloc": null
+      "code_files": null,
+      "files_by_band": {
+        "at_risk": null,
+        "excellent": null,
+        "fair": null,
+        "good": null,
+        "needs_work": null
       },
-      "file_count": null,
+      "files_scored": null,
       "hotspot_health": null,
       "open_findings": null,
+      "production_average": null,
       "worst_performer_path": null,
       "worst_performer_score": null
     },
@@ -1278,12 +1269,9 @@
       null
     ],
     "git_health": {
-      "avg_bus_factor": null,
       "churn_trend": null,
-      "files_git_attributed": null,
-      "files_with_bus_factor_1": null,
       "hotspot_count": null,
-      "top_churn_modules": [
+      "riskiest_files": [
         null
       ]
     },
@@ -1623,22 +1611,12 @@
     },
     "targets": {
       "packages/core/src/repowise/core/ingestion/call_resolver.py": {
-        "bus_factor": null,
         "co_change_partners": [
           {
-            "direction": null,
-            "evidence_kind": null,
+            "conf_ab": null,
             "file_path": null,
             "has_import_link": null,
-            "has_structural_link": null,
-            "last_co_change": null,
-            "provenance": null,
-            "relationship_type": null,
-            "structural_relationship_types": [
-              null
-            ],
-            "support": null,
-            "weight": null
+            "support": null
           }
         ],
         "co_change_partners_emitted": null,
@@ -1647,7 +1625,6 @@
         "co_change_partners_total": null,
         "co_change_partners_truncated": null,
         "commit_count_capped": null,
-        "contributor_count": null,
         "defect_profile": {
           "bug_magnet": null,
           "fix_count": null,
@@ -1665,10 +1642,7 @@
         "hotspot_score": null,
         "is_hotspot": null,
         "line_coverage_pct": null,
-        "owner_pct": null,
         "primary_owner": null,
-        "recent_owner": null,
-        "recent_owner_pct": null,
         "risk_summary": null,
         "security_signals": [],
         "target": null,
